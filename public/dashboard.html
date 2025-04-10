@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat</title>
+    <script src="https://cdn.socket.io/4.0.1/socket.io.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/forge/0.10.0/forge.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #121212;
+            color: #fff;
+            text-align: center;
+            padding: 20px;
+        }
+        .chat-container {
+            width: 400px;
+            background: #1e1e1e;
+            border-radius: 10px;
+            padding: 15px;
+            margin: 20px auto;
+            box-shadow: 0 4px 10px rgba(255, 255, 255, 0.1);
+        }
+        .messages {
+            max-height: 300px;
+            overflow-y: auto;
+            border-bottom: 2px solid #333;
+            padding-bottom: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .message {
+            padding: 8px 12px;
+            border-radius: 8px;
+            max-width: 70%;
+            word-wrap: break-word;
+            animation: fadeIn 0.2s ease-in-out;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .sent {
+            background-color: #4caf50;
+            align-self: flex-end;
+            text-align: right;
+            color: white;
+        }
+        .received {
+            background-color: #007bff;
+            align-self: flex-start;
+            text-align: left;
+            color: white;
+        }
+        .input-container {
+            display: flex;
+            gap: 5px;
+            margin-top: 10px;
+        }
+        input, button {
+            padding: 10px;
+            border-radius: 5px;
+            border: none;
+            outline: none;
+        }
+        input {
+            flex: 1;
+            background: #2a2a2a;
+            color: white;
+        }
+        button {
+            background: #4caf50;
+            color: white;
+            cursor: pointer;
+            transition: 0.3s;
+        }
+        button:hover {
+            background: #45a049;
+        }
+    </style>
+</head>
+<body>
+    <h2>Chat</h2>
+    <input type="text" id="receiver" placeholder="Receiver's username">
+    <button onclick="openChat()">Open Chat</button>
+    <div id="chatContainers"></div>
+
+    <script>
+        const socket = io();
+        let privateKey;
+        let publicKeys = {};
+        const username = prompt("Enter your username:");
+        const chatBoxes = {};
+
+        fetch(`/get-private-key?username=${username}`)
+            .then(res => res.json())
+            .then(data => {
+                if (data.privateKey) {
+                    privateKey = forge.pki.privateKeyFromPem(data.privateKey);
+                }
+            });
+
+        function getPublicKey(receiver) {
+            if (publicKeys[receiver]) return Promise.resolve(publicKeys[receiver]);
+            return fetch(`/get-public-key?receiver=${receiver}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.publicKey) {
+                        publicKeys[receiver] = forge.pki.publicKeyFromPem(data.publicKey);
+                        return publicKeys[receiver];
+                    }
+                });
+        }
+
+        function openChat() {
+            const receiver = document.getElementById("receiver").value;
+            if (!receiver || chatBoxes[receiver]) return;
+
+            const chatContainer = document.createElement("div");
+            chatContainer.className = "chat-container";
+            chatContainer.id = `chatBox-${receiver}`;
+            chatContainer.innerHTML = `
+                <h3>Chat with ${receiver}</h3>
+                <div class="messages" id="messages-${receiver}"></div>
+                <div class="input-container">
+                    <input type="text" id="message-${receiver}" placeholder="Type a message...">
+                    <button onclick="sendMessage('${receiver}')">Send</button>
+                </div>
+            `;
+            document.getElementById("chatContainers").appendChild(chatContainer);
+            chatBoxes[receiver] = chatContainer;
+        }
+
+        async function sendMessage(receiver) {
+            const messageField = document.getElementById(`message-${receiver}`);
+            const message = messageField.value;
+            messageField.value = "";
+            
+            const publicKey = await getPublicKey(receiver);
+            if (!publicKey) return alert("Receiver's public key not found");
+
+            // Generate a random AES key
+            const aesKey = forge.random.getBytesSync(32); // 256-bit key
+            const iv = forge.random.getBytesSync(16); // 128-bit IV
+
+            // Encrypt the message with AES
+            const cipher = forge.cipher.createCipher('AES-CBC', aesKey);
+            cipher.start({iv: iv});
+            cipher.update(forge.util.createBuffer(message, 'utf8'));
+            cipher.finish();
+            const encryptedMessageAES = cipher.output.getBytes();
+            
+            // Encrypt the AES key with RSA
+            const encryptedKey = publicKey.encrypt(aesKey);
+            
+            // Format the package
+            const messagePackage = {
+                iv: forge.util.encode64(iv),
+                encryptedKey: forge.util.encode64(encryptedKey),
+                encryptedMessage: forge.util.encode64(encryptedMessageAES)
+            };
+            
+            // Send the encrypted message package
+            socket.emit("sendMessage", { 
+                sender: username, 
+                receiver, 
+                messagePackage: JSON.stringify(messagePackage)
+            });
+            
+            document.getElementById(`messages-${receiver}`).innerHTML += `<div class='message sent'><b>You:</b> ${message}</div>`;
+        }
+
+        
+        socket.on(`receiveMessage-${username}`, ({ sender, messagePackage }) => {
+    fetch(`/decrypt-message?username=${username}`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ messagePackage })
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.decryptedMessage) {
+            if (!chatBoxes[sender]) {
+                document.getElementById("receiver").value = sender;
+                openChat();
+            }
+            document.getElementById(`messages-${sender}`).innerHTML += 
+                `<div class='message received'><b>${sender}:</b> ${data.decryptedMessage}</div>`;
+        }
+    })
+    .catch(error => console.error("Error decrypting message:", error));
+});
+    </script>
+</body>
+</html>
